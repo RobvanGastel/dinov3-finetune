@@ -1,4 +1,9 @@
 .ipynb_checkpoints/
-data/
 __pycache__
 *.egg-info/
+*.pth
+*.pt
+*.png
+*.log
+/wandb/
+/logs/

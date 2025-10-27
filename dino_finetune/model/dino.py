@@ -8,6 +8,10 @@ from .lora import LoRA
 from .linear_decoder import LinearClassifier
 from .fpn_decoder import FPNDecoder
 
+# model/segmentation/models/__init__.py
+from .segmentation.models.heads.mask2former_head import Mask2FormerHead
+from .segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
+
 
 class DINOEncoderLoRA(nn.Module):
     def __init__(
@@ -18,7 +22,13 @@ class DINOEncoderLoRA(nn.Module):
         n_classes: int = 1000,
         use_lora: bool = False,
         use_fpn: bool = False,
+        use_mask2former: bool = False,
         img_dim: tuple[int, int] = (520, 520),
+        m2f_hidden_dim: int = 256,
+        m2f_queries: int = 100,
+        m2f_dec_layers: int = 6,
+        m2f_heads: int = 8,
+        m2f_dim_ffn: int = 2048,
     ):
         """The DINOv2 encoder-decoder model for finetuning to downstream tasks.
 
@@ -44,6 +54,7 @@ class DINOEncoderLoRA(nn.Module):
         # Number of previous layers to use as input
         self.inter_layers = 4
         self.use_fpn = use_fpn
+        self.use_mask2former = use_mask2former
 
         self.encoder = encoder
         for param in self.encoder.parameters():
@@ -52,6 +63,7 @@ class DINOEncoderLoRA(nn.Module):
         # Decoder
         # Patch size is given by (490/14)**2 = 35 * 35
         if self.use_fpn:
+            print("Using FPN decoder")
             self.decoder = FPNDecoder(
                 emb_dim,
                 inter_layers=self.inter_layers,
@@ -60,7 +72,38 @@ class DINOEncoderLoRA(nn.Module):
                 patch_w=int(img_dim[1] / encoder.patch_size),
                 n_classes=n_classes,
             )
+
+        elif self.use_mask2former:
+            print("Using Mask2Former decoder")
+
+            # 1) Adapter con el backbone correcto + índices de ViT-L
+            self.backbone = DINOv3_Adapter(
+                backbone=self.encoder,  # <-- importante
+                interaction_indexes=[4, 11, 17, 23],  # <-- ViT-L
+                # (opcional) otros flags: with_cp=True, deform_num_heads=m2f_heads, etc.
+            )
+            embed_dim = self.encoder.embed_dim
+            patch = self.encoder.patch_size  # 16 para ViT-L/16
+
+            # 2) input_shape al estilo Meta (stride=4 en todas las entradas)
+            input_shape = {
+                "1": (embed_dim, patch * 4, patch * 4, 4),
+                "2": (embed_dim, patch * 2, patch * 2, 4),
+                "3": (embed_dim, patch, patch, 4),
+                "4": (embed_dim, patch // 2, patch // 2, 4),
+            }
+
+            # 3) Head oficial (puedes usar hidden_dim=256 para ahorrar memoria)
+            self.decoder = Mask2FormerHead(
+                input_shape=input_shape,
+                hidden_dim=m2f_hidden_dim,  # p. ej., 256
+                num_classes=n_classes - 1,  # sin contar background
+                ignore_value=255,
+                transformer_in_feature="multi_scale_pixel_decoder",
+            )
+
         else:
+            print("Using linear decoder")
             self.decoder = LinearClassifier(
                 emb_dim,
                 patch_h=int(img_dim[0] / encoder.patch_size),
@@ -107,7 +150,6 @@ class DINOEncoderLoRA(nn.Module):
             nn.init.zeros_(w_b.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         # If the FPN decoder is used, we take the n last layers for
         # our decoder to get a better segmentation result.
         if self.use_fpn:
@@ -117,6 +159,13 @@ class DINOEncoderLoRA(nn.Module):
             )
             logits = self.decoder(feature)
 
+        elif self.use_mask2former:
+            features_dict = self.backbone(x)  # dict con claves "1","2","3","4"
+            out = self.decoder(
+                features_dict
+            )  # dict: {"pred_logits","pred_masks","aux_outputs"}
+            return out
+
         else:
             feature = self.encoder.forward_features(x)
 
@@ -124,12 +173,10 @@ class DINOEncoderLoRA(nn.Module):
             patch_embeddings = feature["x_norm_patchtokens"]
             logits = self.decoder(patch_embeddings)
 
-        logits = F.interpolate(
-            logits,
-            size=x.shape[2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+        if not self.use_mask2former:
+            logits = F.interpolate(
+                logits, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
         return logits
 
     def save_parameters(self, filename: str) -> None:

@@ -153,16 +153,162 @@ class ADE20kDataset(Dataset):
         return image, mask
 
 
+def _add_mod_suffix(stem: str) -> str:
+    stem = os.path.splitext(stem)[0]
+    return stem if stem.endswith("_0000") else stem + "_0000"
+
+
+def _strip_mod_suffix(stem: str) -> str:
+    return stem[:-5] if stem.endswith("_0000") else stem
+
+
+class LiverUSDataset(Dataset):
+    def __init__(
+        self,
+        root: str,
+        transform: Optional[A.Compose] = None,
+        valid_ids: tuple[int, ...] = (0, 1, 2),
+        ignore_index: int = 255,
+        subset_ids: Optional[list[str]] = None,  # <- nuevo
+        folder_name: str = "Dataset771_livervsi",  # <- nuevo
+    ):
+        # en LiverUSDataset.__init__
+        base = os.path.join(
+            root, folder_name
+        )  # antes: os.path.join(root, "liver", split)
+        self.images_dir = os.path.join(base, "imagesTr")
+        self.masks_dir = os.path.join(base, "labelsTr")
+        self.transform = transform
+        self.valid_ids = set(valid_ids)
+        self.ignore_index = ignore_index
+        self.n_classes = len(valid_ids)
+        self.subset_ids = set(subset_ids) if subset_ids is not None else None
+
+        assert os.path.isdir(self.images_dir), f"Not found: {self.images_dir}"
+        assert os.path.isdir(self.masks_dir), f"Not found: {self.masks_dir}"
+
+        # dentro de LiverUSDataset.__init__
+        files = [
+            f
+            for f in os.listdir(self.images_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+
+        if self.subset_ids is not None:
+            wanted = {
+                _add_mod_suffix(x.lower()) for x in self.subset_ids
+            }  # <- agrega _0000
+            files = [f for f in files if os.path.splitext(f.lower())[0] in wanted]
+            if not files:
+                raise RuntimeError(
+                    "subset_ids dejó el split vacío (revisa nombres y sufijo _0000)."
+                )
+
+        self.image_files = sorted(files)
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def _remap_invalid_to_ignore(self, mask: np.ndarray) -> np.ndarray:
+        invalid = ~np.isin(mask, list(self.valid_ids))
+        if invalid.any():
+            mask = mask.copy()
+            mask[invalid] = self.ignore_index
+        return mask
+
+    def __getitem__(self, idx: int):
+        # --- dentro de LiverUSDataset.__getitem__ ---
+        img_name = self.image_files[idx]
+        img_stem = os.path.splitext(img_name)[0]
+
+        # máscaras NO tienen _0000
+        mask_stem = _strip_mod_suffix(img_stem)
+        msk_path = os.path.join(self.masks_dir, mask_stem + ".png")
+
+        image_bgr = cv2.imread(os.path.join(self.images_dir, img_name))
+        mask = cv2.imread(msk_path, cv2.IMREAD_GRAYSCALE)
+
+        # comprobaciones claras (evitan AttributeError si falla la lectura)
+        if image_bgr is None:
+            raise FileNotFoundError(
+                f"No pude leer imagen: {os.path.join(self.images_dir, img_name)}"
+            )
+        if mask is None:
+            raise FileNotFoundError(f"No pude leer máscara (sin _0000): {msk_path}")
+
+        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        mask = self._remap_invalid_to_ignore(mask)
+        if self.transform is not None:
+            transformed = self.transform(image=image, mask=mask)
+            image = transformed["image"]
+            mask = transformed["mask"]
+
+        image = np.moveaxis(image, -1, 0).astype(np.float32) / 255.0
+        mask = mask.astype(np.int64)
+        return image, mask
+
+
+# splits_utils.py
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+
+def load_fold_split(json_path: str | Path, fold: int) -> Dict[str, List[str]]:
+    """
+    Lee un JSON con una lista de folds: [{ "train":[...], "val":[...] }, ...]
+    Devuelve dict con keys: 'train', 'val'. Si 'val' no existe, lo infiere.
+    """
+    json_path = Path(json_path)
+    with json_path.open("r") as f:
+        folds = json.load(f)
+
+    if not isinstance(folds, list):
+        raise ValueError("El JSON debe ser una lista de objetos (uno por fold).")
+
+    if fold < 0 or fold >= len(folds):
+        raise IndexError(f"fold={fold} fuera de rango (0..{len(folds) - 1}).")
+
+    entry = folds[fold]
+    if "train" not in entry:
+        raise KeyError(f"El fold {fold} no contiene la clave 'train'.")
+
+    train_ids = list(entry["train"])
+    val_ids = list(entry.get("val", []))
+
+    # Si no hay 'val', lo inferimos del complemento de train dentro del universo total
+    if not val_ids:
+        # Universo = unión de todos los ids presentes en todos los folds
+        all_ids = set()
+        for e in folds:
+            all_ids.update(e.get("train", []))
+            all_ids.update(e.get("val", []))
+        val_ids = sorted(list(all_ids.difference(set(train_ids))))
+
+    return {"train": train_ids, "val": val_ids}
+
+
+def split_ids_for_fold(json_path: str | Path, fold: int) -> Tuple[List[str], List[str]]:
+    s = load_fold_split(json_path, fold)
+    return s["train"], s["val"]
+
+
 def get_dataloader(
     dataset_name: str,
-    img_dim: tuple[int, int] = (490, 490),
+    img_dim=(490, 490),
     batch_size: int = 6,
-    corruption_severity: int = None,
-) -> tuple[DataLoader, DataLoader]:
-    """Get the dataloaders for Pascal VOC (voc) or ADE20k (ade20k)
+    corruption_severity: int | None = None,
+    root: str = "./data",
+    split_json: str | None = None,
+    folder_name: str = "Dataset771_livervsi",
+    n_workers: int = 32,
+    fold: int | None = None,
+):
+    """Get the dataloaders for Pascal VOC (voc) or ADE20k (ade20k) or liver.
 
     Args:
-        dataset_name (str): The name of the dataset either, `voc` or `ade20k`.
+        dataset_name (str): The name of the dataset either, `voc` or `ade20k` or `liver`.
         img_dim (tuple[int, int], optional): The input size of the images.
             Defaults to (490, 490).
         batch_size (int, optional): The batch size of the dataloader. Defaults to 6.
@@ -172,15 +318,34 @@ def get_dataloader(
     Returns:
         tuple[DataLoader, DataLoader]: The train and validation loader respectively.
     """
-    assert dataset_name in ["ade20k", "voc"], "dataset name not in [ade20k, voc]"
+    assert dataset_name in ["ade20k", "voc", "liver"], (
+        "dataset name not in [ade20k, voc, liver]"
+    )
     transform = A.Compose([A.Resize(height=img_dim[0], width=img_dim[1])])
 
+    train_ids = val_ids = None
+    if dataset_name == "liver" and split_json is not None and fold is not None:
+        train_ids, val_ids = split_ids_for_fold(split_json, fold)
+
+    if dataset_name == "liver":
+        train_dataset = LiverUSDataset(
+            root=root,
+            folder_name=folder_name,
+            transform=transform,
+            subset_ids=train_ids,
+        )
+
+        if corruption_severity is not None:
+            transform = get_corruption_transforms(img_dim, corruption_severity)
+        val_dataset = LiverUSDataset(
+            root=root, folder_name=folder_name, transform=transform, subset_ids=val_ids
+        )
     if dataset_name == "voc":
         train_dataset = PascalVOCDataset(
             root="./data",
             year="2012",
             image_set="train",
-            download=False,
+            download=True,
             transform=transform,
         )
 
@@ -211,7 +376,9 @@ def get_dataloader(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        num_workers=32,
+        num_workers=n_workers,
+        pin_memory=True,
+        prefetch_factor=2,
         persistent_workers=True,
         shuffle=True,
     )

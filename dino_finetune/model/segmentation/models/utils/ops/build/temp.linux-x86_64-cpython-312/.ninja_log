@@ -1,0 +1,4 @@
+# ninja log v5
+0	4723	1760662813713359463	/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-312/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/src/cpu/ms_deform_attn_cpu.o	3dc3a5fd0992e6b4
+1	14552	1760662823541460936	/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-312/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/src/vision.o	82c7a9eec2fd354c
+0	17603	1760662826573492237	/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/build/temp.linux-x86_64-cpython-312/data/GitHub/dinov3-finetune/dino_finetune/model/segmentation/models/utils/ops/src/cuda/ms_deform_attn_cuda.o	4da8df419c19c8c1
